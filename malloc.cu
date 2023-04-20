@@ -2,24 +2,33 @@
 #include <cuda_runtime.h>
 #include <getopt.h>
 #include "malloc.h"
+#include <chrono>
+#include <iostream>
+#include <cooperative_groups.h>
+using namespace cooperative_groups;
 
 typedef struct counters
 {
-    int malloc_counter;
-    int free_counter;
+    volatile int malloc_counter;
+    volatile int free_counter;
+    int thread_count;
 }counters_t;
+
+__device__ void atomicAggDec(volatile int *ctr) {
+  auto g = coalesced_threads();
+  int warp_res;
+  if(g.thread_rank() == 0)
+    warp_res = atomicSub((int*)ctr, g.size()); // divergence risk
+}
 
 __device__ void* linear_cudaMalloc(int size_in_bytes, counters_t *counter, void *g_base_addr)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if(tid == 0)
-        cudaMalloc((void**)g_base_addr, size_in_bytes);
+        cudaMalloc((void**)g_base_addr, size_in_bytes * counter->thread_count);
 
-    atomicSub(&counter->malloc_counter, 1);
-    while(counter->malloc_counter > 0)
-    {
-        __syncthreads();
-    }
+    atomicAggDec(&counter->malloc_counter);
+    while(counter->malloc_counter > 0);
     return (void*)(((*(char**)g_base_addr)) + (size_in_bytes * tid));
 }
 
@@ -27,13 +36,11 @@ __device__ void linear_cudaFree(counters_t *counter, void *addr)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
-    atomicSub(&counter->free_counter, 1);
-    while(counter->malloc_counter > 0);
+    atomicAggDec(&counter->free_counter);
+    while(counter->free_counter > 0);
 
     if(tid == 0)
-    {
         cudaFree(addr);
-    }
 }
 
 __global__ void myKernel(int *output, int n)
@@ -60,8 +67,7 @@ __global__ void linear_malloc_kernel(int *output, int n, counters_t *counter, vo
     int id = blockIdx.x * blockDim.x + threadIdx.x;
 
     dev_array = (int*)linear_cudaMalloc(n*sizeof(int), counter, g_base_addr);
-
-    printf("linear , %d , %p \n", id, dev_array);
+    printf("%d , %p\n", id, dev_array);
     for (int i = 0; i < n; i++)
     {
         dev_array[i] = (id * i);
@@ -117,8 +123,13 @@ int main(int argc, char **argv)
     int data_size = grid_size * block_size * sizeof(int);
     cudaMallocManaged((void **)&dev_output, data_size);
 
+    auto start = std::chrono::high_resolution_clock::now();
     myKernel<<<grid_size, block_size>>>(dev_output, malloc_size);
     cudaDeviceSynchronize();
+    auto end = std::chrono::high_resolution_clock::now();
+
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::cout << "cudaMalloc Execution time: " << duration << " milliseconds" << std::endl;
 
     int output_sum = 0;
     for (int i = 0; i < data_size/sizeof(int); i++)
@@ -145,8 +156,15 @@ int main(int argc, char **argv)
 
     cudaMemset((void*)dev_output, 0, data_size);
 
+    counter->thread_count = malloc_size * grid_size * block_size;
+    start = std::chrono::high_resolution_clock::now();
     linear_malloc_kernel<<<grid_size, block_size>>>(dev_output, malloc_size, counter, g_base_address);
     cudaDeviceSynchronize();
+
+    end = std::chrono::high_resolution_clock::now();
+
+    duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    std::cout << "cudaMalloc Execution time: " << duration << " milliseconds" << std::endl;
 
     output_sum = 0;
     for (int i = 0; i < data_size/sizeof(int); i++)
